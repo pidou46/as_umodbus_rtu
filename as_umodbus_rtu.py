@@ -15,7 +15,7 @@ POLYNOMIAL = 0xA001 # bit reverse of 0x8005
 
 #Modbus-RTU
 #functions codes PDU
-#just a subset can be extended as needed
+#just a subset, can be extended as needed
 READ_HOLDING_REGISTER = 0x03
 READ_INPUT_REGISTER = 0x04
 WRITE_SINGLE_REGISTER = 0x06
@@ -27,27 +27,40 @@ RESET_ENERGY = 0x42
 
 #Server=Master
 class Server:
-    def __init__(self, uart):
+    def __init__(self, uart, crc_check=False):
         self.uart=uart
         self.clients=[None]*32
         self.swriter = asyncio.StreamWriter(self.uart, {})
         self.sreader = asyncio.StreamReader(self.uart)
+        self.crc_check = crc_check #set to True if you want crc check on response
         
     def add_client(self,client):
         self.clients[client.address]=client
         
         
     async def sender(self,request):
-        print(f"send: {request}")
+        #print(f"send: {request}")
         self.swriter.write(request)
         await self.swriter.drain()
 
     async def receiver(self):
         res = await self.sreader.read(40)
-        print(f'Received: {res}')
-        address=res[0]
-        client=self.clients[address]
-        client.data=res[1:]  #update client property #TODO: check if complete response is needed for crc claculation if yes parse complete response
+        #print(f'Received: {res}')
+        
+        if self.crc_check == True:
+            if crc16(res) == b'\x00\x00':
+                #print("crc_check: ok")
+                address=res[0]
+                client=self.clients[address]
+                client.data=res[1:-2]#update client property remove first byte (adress) and two last bytes (crc) 
+            else:
+                print("crc_check: error")
+        else:
+            address=res[0]
+            client=self.clients[address]
+            client.data=res[1:-2]#update client property remove first byte (adress) and two last bytes (crc) 
+            
+        client.data_decode() #decode message (specific to modbus device)
             
     async def run(self,delay):
         while True:
@@ -72,8 +85,9 @@ class Server:
 
     def check_address(self,address):
         request=int.to_bytes(address,1,'big')
-        request+=b'\x03\x00\x02\x00\x01'
-        request += crc16(request)
+        request+=int.to_bytes(READ_HOLDING_REGISTER,1,'big')
+        request+=b'\x00\x02\x00\x01'
+        request+=crc16(request)
         
         self.uart.write(request)
 
@@ -114,36 +128,34 @@ class Server:
             self.address=new_address
 
 
-#Slave=Client
 class Client:
-    def __init__(self,address,request,crc_check=False):
+    def __init__(self,address,request):
         self.address=address
+        #request is calculed once at object creation to avoid overhead and allow highest sampling rate
         self.request=int.to_bytes(address,1,'big')
         self.request+=request
         self.request+=crc16(self.request)
         self.data=None
-        self.crc_check=crc_check
         
-    #overload this method in your specific case and call when needed from a coro running concurently
+    #overload this method to suit your specific case and modbus device
     def data_decode(self):
-        #if crc_check:
-        #    if crc16(self.data) == self.data[-2:]: #crc is 2 bytes long
-        #data=self.data[0:-2]
         #TODO: decode data
-        pass
+        print(f"{self.address} : {self.data}")
+        
 
-
-
+#TODO: implement viper version for fasted calculation
 def crc16(data):
     crc = PRESET
     for c in data:
         crc = crc ^ c
         for j in range(8):
-            if crc & 0x01:
-                crc = (crc >> 1) ^ POLYNOMIAL
+            if (crc & 1) == 0:
+                crc = crc >> 1
             else:
                 crc = crc >> 1
+                crc = crc ^ POLYNOMIAL
     return struct.pack('<H',crc)
+
 
 
 #Boilerplate code from petterhinch async tutorial
@@ -163,15 +175,17 @@ async def main():
     
     uart = UART(2, 9600, bits=8, parity=None, stop=1, timeout=0, tx=16, rx=17)
     
-    modbus_server = Server(uart)
+    modbus_server = Server(uart,crc_check=True)
     
     modbus_server.scan(4)
+    
+    request=int.to_bytes(READ_INPUT_REGISTER,1,'big')
+    request+=b'\x00\x00\x00\x0A'
 
-    request=b'\x04\x00\x00\x00\x0A' #READ_INPUT_REGISTER
-
+    
     client_1 = Client(1,request)
     modbus_server.add_client(client_1)
-    
+
     client_2 = Client(2,request)
     modbus_server.add_client(client_2)
     
