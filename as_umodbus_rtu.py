@@ -5,6 +5,7 @@
 
 import uasyncio as asyncio
 from machine import UART
+from array import array
 from time import sleep
 from sys import exit
 import struct
@@ -12,6 +13,19 @@ import struct
 #crc16 constants valide for modbus-RTU
 PRESET = 0xFFFF
 POLYNOMIAL = 0xA001 # bit reverse of 0x8005
+
+#Precalculated table of 32bytes to speed up crc calculation
+#https://github.com/orgs/micropython/discussions/12891
+_tab=array('H', [0, 52225, 55297, 5120, 61441, 15360, 10240, 58369, 40961, 27648, 30720, 46081, 20480, 39937, 34817, 17408])
+# _tab = array("H", (_init4bit(i, POLYNOMIAL) for i in range(16))) # Create the table, based on _init4bit(), POLYNOMIAL
+# 
+# def _init4bit(crc, poly):     # create a single entry to the CRC table
+#     for j in range(4):
+#         if crc & 0x01:
+#             crc = (crc >> 1) ^ poly
+#         else:
+#             crc = crc >> 1
+#     return crc
 
 #Modbus-RTU
 #functions codes PDU
@@ -39,7 +53,7 @@ class Server:
         
         
     async def sender(self,request):
-        #print(f"send: {request}")
+        print(f"send: {request}")
         self.swriter.write(request)
         await self.swriter.drain()
 
@@ -48,19 +62,19 @@ class Server:
         #print(f'Received: {res}')
         
         if self.crc_check == True:
-            if crc16(res) == b'\x00\x00':
+            if int.to_bytes(crc16(PRESET, res,len(res),_tab),2,'little') == b'\x00\x00':
                 #print("crc_check: ok")
                 address=res[0]
                 client=self.clients[address]
                 client.data=res[1:-2]#update client property remove first byte (adress) and two last bytes (crc) 
+                client.data_decode() #decode message (specific to modbus device)
             else:
                 print("crc_check: error")
         else:
             address=res[0]
             client=self.clients[address]
             client.data=res[1:-2]#update client property remove first byte (adress) and two last bytes (crc) 
-            
-        client.data_decode() #decode message (specific to modbus device)
+            client.data_decode() #decode message (specific to modbus device)
             
     async def run(self,delay):
         while True:
@@ -87,8 +101,8 @@ class Server:
         request=int.to_bytes(address,1,'big')
         request+=int.to_bytes(READ_HOLDING_REGISTER,1,'big')
         request+=b'\x00\x02\x00\x01'
-        request+=crc16(request)
-        
+        request+=int.to_bytes(crc16(PRESET, request,len(request),_tab),2,'little')
+        print(request)
         self.uart.write(request)
 
         sleep(0.1)
@@ -114,7 +128,7 @@ class Server:
         request+=int.to_bytes(WRITE_MODBUS_ADDRESS,2,'big')
         request+=b'\x00'
         request+=new_address
-        request += crc16(request)
+        request += int.to_bytes(crc16(PRESET, request,len(request),_tab),2,'little')
         
         self.uart.write(request)
 
@@ -134,7 +148,8 @@ class Client:
         #request is calculed once at object creation to avoid overhead and allow highest sampling rate
         self.request=int.to_bytes(address,1,'big')
         self.request+=request
-        self.request+=crc16(self.request)
+        self.request+=int.to_bytes(crc16(PRESET, self.request,len(self.request),_tab),2,'little')
+        print(f"request: {self.request}")
         self.data=None
         
     #overload this method to suit your specific case and modbus device
@@ -143,18 +158,31 @@ class Client:
         print(f"{self.address} : {self.data}")
         
 
-#TODO: implement viper version for fasted calculation
-def crc16(data):
-    crc = PRESET
-    for c in data:
-        crc = crc ^ c
-        for j in range(8):
-            if (crc & 1) == 0:
-                crc = crc >> 1
-            else:
-                crc = crc >> 1
-                crc = crc ^ POLYNOMIAL
-    return struct.pack('<H',crc)
+# 71µs per byte
+# def crc16(data):
+#     crc = PRESET
+#     for c in data:
+#         crc = crc ^ c
+#         for j in range(8):
+#             if (crc & 1) == 0:
+#                 crc = crc >> 1
+#             else:
+#                 crc = crc >> 1
+#                 crc = crc ^ POLYNOMIAL
+#     return struct.pack('<H',crc)
+
+# crc16 viper 4bit table implementation from https://github.com/rkompass and https://github.com/robert-hh
+# https://github.com/orgs/micropython/discussions/12891
+# 2.16µs per byte
+@micropython.viper
+def crc16(crc: int, data: ptr8, n: int, tab: ptr16) -> int:
+    i: int  = 0
+    while i < n:
+        d = data[i]
+        crc = (crc >> 4) ^ tab[(crc ^ d) & 0x0f]
+        crc = (crc >> 4) ^ tab[(crc ^ (d >> 4)) & 0x0f]
+        i += 1
+    return crc
 
 
 
@@ -168,7 +196,10 @@ def set_global_exception():
     loop = asyncio.get_event_loop()
     loop.set_exception_handler(handle_exception)
 
-
+async def toto(): #never ending asyncio coro
+    while True:
+        print("toto")
+        await asyncio.sleep(4)
 
 async def main():
     set_global_exception()  # Debug aid
@@ -189,8 +220,9 @@ async def main():
     client_2 = Client(2,request)
     modbus_server.add_client(client_2)
     
-    await modbus_server.run(delay=1)
+    asyncio.create_task(toto()) #add another asyncio task here
     
+    await modbus_server.run(delay=1)
     
 
 if __name__=="__main__":
